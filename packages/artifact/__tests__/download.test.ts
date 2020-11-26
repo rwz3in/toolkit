@@ -120,7 +120,7 @@ describe('Download Tests', () => {
     const response = 'gzip worked on the first try\n'
     const targetPath = path.join(root, 'FileA.txt')
 
-    setupDownloadItemResponse(true, 200, response)
+    setupDownloadItemResponse(true, 200, false, response)
     const downloadHttpClient = new DownloadHttpClient()
 
     const items: DownloadItem[] = []
@@ -141,7 +141,7 @@ describe('Download Tests', () => {
     const response = 'plaintext worked on the first try\n'
     const targetPath = path.join(root, 'FileB.txt')
 
-    setupDownloadItemResponse(false, 200, response)
+    setupDownloadItemResponse(false, 200, false, response)
     const downloadHttpClient = new DownloadHttpClient()
 
     const items: DownloadItem[] = []
@@ -166,7 +166,7 @@ describe('Download Tests', () => {
       const response = 'try, try again\n'
       const targetPath = path.join(root, `FileC-${statusCode}.txt`)
 
-      setupDownloadItemResponse(false, statusCode, response)
+      setupDownloadItemResponse(false, statusCode, false, response)
       const downloadHttpClient = new DownloadHttpClient()
 
       const items: DownloadItem[] = []
@@ -182,6 +182,49 @@ describe('Download Tests', () => {
       const size = (await fs.stat(targetPath)).size
       expect(size).toEqual(response.length)
     }
+  })
+
+  it('Test retry on truncated response with gzip', async () => {
+    const response = 'Sometimes gunzip fails on the first try\n'
+    const targetPath = path.join(root, 'FileD.txt')
+
+    setupDownloadItemResponse(true, 200, true, response)
+    const downloadHttpClient = new DownloadHttpClient()
+
+    const items: DownloadItem[] = []
+    items.push({
+      sourceLocation: `${configVariables.getRuntimeUrl()}_apis/resources/Containers/13?itemPath=my-artifact%2FFileD.txt`,
+      targetPath
+    })
+
+    await expect(
+      downloadHttpClient.downloadSingleArtifact(items)
+    ).resolves.not.toThrow()
+
+    const size = (await fs.stat(targetPath)).size
+    expect(size).toEqual(response.length)
+  })
+
+  it('Test retry on truncated response without gzip', async () => {
+    const response =
+      'You have to inspect the content-length header to know if you got everything\n'
+    const targetPath = path.join(root, 'FileE.txt')
+
+    setupDownloadItemResponse(false, 200, true, response)
+    const downloadHttpClient = new DownloadHttpClient()
+
+    const items: DownloadItem[] = []
+    items.push({
+      sourceLocation: `${configVariables.getRuntimeUrl()}_apis/resources/Containers/13?itemPath=my-artifact%2FFileD.txt`,
+      targetPath
+    })
+
+    await expect(
+      downloadHttpClient.downloadSingleArtifact(items)
+    ).resolves.not.toThrow()
+
+    const size = (await fs.stat(targetPath)).size
+    expect(size).toEqual(response.length)
   })
 
   /**
@@ -249,17 +292,24 @@ describe('Download Tests', () => {
   function setupDownloadItemResponse(
     isGzip: boolean,
     firstHttpResponseCode: number,
+    truncateFirstResponse: boolean,
     response: string | Buffer
   ): void {
     const spyInstance = jest
       .spyOn(HttpClient.prototype, 'get')
       .mockImplementationOnce(async () => {
         if (firstHttpResponseCode === 200) {
+          const fullResponse = await constructResponse(isGzip, response)
+          const actualResponse = truncateFirstResponse
+            ? fullResponse.subarray(0, 3)
+            : fullResponse
+
           return {
             message: getDownloadResponseMessage(
               firstHttpResponseCode,
               isGzip,
-              await constructResponse(isGzip, response)
+              fullResponse.length,
+              actualResponse
             ),
             readBody: emptyMockReadBody
           }
@@ -268,6 +318,7 @@ describe('Download Tests', () => {
             message: getDownloadResponseMessage(
               firstHttpResponseCode,
               false,
+              0,
               null
             ),
             readBody: emptyMockReadBody
@@ -279,11 +330,13 @@ describe('Download Tests', () => {
     if (firstHttpResponseCode !== 200) {
       spyInstance.mockImplementationOnce(async () => {
         // chained response, if the HTTP GET function gets called again, return a successful response
+        const fullResponse = await constructResponse(isGzip, response)
         return {
           message: getDownloadResponseMessage(
             200,
             isGzip,
-            await constructResponse(isGzip, response)
+            fullResponse.length,
+            fullResponse
           ),
           readBody: emptyMockReadBody
         }
@@ -307,6 +360,7 @@ describe('Download Tests', () => {
   function getDownloadResponseMessage(
     httpResponseCode: number,
     isGzip: boolean,
+    contentLength: number,
     response: Buffer | null
   ): http.IncomingMessage {
     let readCallCount = 0
@@ -331,7 +385,9 @@ describe('Download Tests', () => {
     })
 
     mockMessage.statusCode = httpResponseCode
-    mockMessage.headers = {}
+    mockMessage.headers = {
+      'content-length': contentLength.toString()
+    }
 
     if (isGzip) {
       mockMessage.headers['content-encoding'] = 'gzip'
